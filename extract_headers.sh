@@ -1,114 +1,169 @@
 #!/bin/bash
+# Optimized Kernel Header Extractor for LineageOS (GKI + Modules)
+#
+# Goals:
+# 1. Functional: Include all headers required by vendor modules (recursive resolution).
+# 2. Structure: Maintain correct kernel header directory structure.
+# 3. Base: Use pre-generated UAPI from GKI Core as the base.
+
+set -e
 
 # ================= CONFIGURATION =================
-# Path to your GKI Core (Repo 1) - pure Google code
+# Path to GKI Core (Repo 1)
 KERNEL_CORE="/home/rahulsnair/android/lineage/kernel/motorola/cybert"
 
-# Path to your Modules/Drivers (Repo 2) - Motorola/MTK code
+# Path to Modules/Drivers (Repo 2)
 KERNEL_MODULES="/home/rahulsnair/android/lineage/kernel/motorola/cybert-modules"
 
-# Destination: Your LineageOS device tree headers
-OUTPUT_DIR="/home/rahulsnair/android/lineage/device/motorola/cybert-kernel/headers"
+# Destination: LineageOS device tree directory
+DEST_DIR="/home/rahulsnair/android/lineage/device/motorola/cybert-kernel"
+TARBALL_NAME="kernel-uapi-headers.tar.gz"
+
+# Staging Directory for extraction
+OUTPUT_DIR=$(mktemp -d)
+trap 'rm -rf "$OUTPUT_DIR"' EXIT
 # =================================================
 
-echo "Starting Kernel 6.1 Split-Source Header Merge (V3)..."
-
-mkdir -p "$OUTPUT_DIR"
+echo ">> Starting Header Extraction for GKI..."
+echo "   Core:    $KERNEL_CORE"
+echo "   Modules: $KERNEL_MODULES"
+echo "   Staging: $OUTPUT_DIR"
+echo "   Target:  $DEST_DIR/$TARBALL_NAME"
 
 # ---------------------------------------------------------
-# Helper Functions
+# Phase 1: Base Headers (Pre-generated GKI UAPI)
 # ---------------------------------------------------------
-sync_headers() {
+echo ">> Phase 1: Copying Base Headers from $KERNEL_CORE/usr/include..."
+
+if [ -d "$KERNEL_CORE/usr/include" ]; then
+    mkdir -p "$OUTPUT_DIR/usr/include"
+    rsync -avm \
+        --include='*/' --include='*.h' \
+        --exclude='*' \
+        "$KERNEL_CORE/usr/include/" "$OUTPUT_DIR/usr/include/" > /dev/null
+else
+    echo "   [!] $KERNEL_CORE/usr/include not found. Falling back to make headers_install..."
+    make -C "$KERNEL_CORE" O="$OUTPUT_DIR" ARCH=arm64 headers_install > /dev/null
+fi
+
+# ---------------------------------------------------------
+# Phase 2: Vendor Module Headers (Overlay)
+# ---------------------------------------------------------
+echo ">> Phase 2: Overlaying Vendor Module Headers..."
+
+merge_headers() {
     local src=$1
     local dest=$2
     if [ -d "$src" ]; then
-        echo ">> Merging $src..."
-        mkdir -p "$dest"
-        # Strict cleanup: Only .h files, no junk.
+        echo "   Merging $src -> $dest"
         rsync -avm \
             --include='*/' --include='*.h' \
-            --exclude='*.c' --exclude='*.o' --exclude='*.S' --exclude='*.ko' \
-            --exclude='*.cmd' --exclude='*.a' --exclude='*.mod*' \
-            --exclude='Makefile' --exclude='Kconfig*' --exclude='Kbuild*' \
-            --exclude='*.txt' --exclude='*.md' --exclude='*.sh' \
-            --exclude='.*' --exclude='*' \
-            "$src/" "$dest/"
+            --exclude='*' \
+            "$src/" "$dest/" > /dev/null
     else
-        echo "-- Skipping $src (Not found)"
+        echo "   [!] Directory not found: $src"
     fi
 }
 
-# ---------------------------------------------------------
-# Phases 1 & 2: Copying Headers
-# ---------------------------------------------------------
-echo ">> Phase 1: Core Kernel Headers (GKI)"
-sync_headers "$KERNEL_CORE/usr/include"      "$OUTPUT_DIR/usr/include"
-sync_headers "$KERNEL_CORE/include"          "$OUTPUT_DIR/include"
-sync_headers "$KERNEL_CORE/arch"             "$OUTPUT_DIR/arch"
-sync_headers "$KERNEL_CORE/drivers"          "$OUTPUT_DIR/drivers"
-sync_headers "$KERNEL_CORE/sound"            "$OUTPUT_DIR/sound"
-sync_headers "$KERNEL_CORE/fs"               "$OUTPUT_DIR/fs"
-sync_headers "$KERNEL_CORE/net"              "$OUTPUT_DIR/net"
+# 1. Merge ALL directories from Modules Include (uapi, linux, soc, dt-bindings, performance, trace, etc.)
+echo "   Merging all vendor includes..."
+for DIR in "$KERNEL_MODULES/include/"*; do
+    if [ -d "$DIR" ]; then
+        BASENAME=$(basename "$DIR")
+        
+        # 'uapi' contents go to the root of usr/include.
+        # All other directories (linux, soc, etc.) are merged as subdirectories.
+        if [ "$BASENAME" == "uapi" ]; then
+             echo "     + Merging uapi root..."
+             merge_headers "$DIR" "$OUTPUT_DIR/usr/include"
+        else
+             echo "     + Merging $BASENAME..."
+             merge_headers "$DIR" "$OUTPUT_DIR/usr/include/$BASENAME"
+        fi
+    fi
+done
 
-# ---------------------------------------------------------
-# Phase 2: Vendor Module Headers (Motorola/MTK)
-# ---------------------------------------------------------
-echo ">> Phase 2: Vendor Module Headers (Motorola/MTK)"
-sync_headers "$KERNEL_MODULES/include"       "$OUTPUT_DIR/include"
-sync_headers "$KERNEL_MODULES/arch"          "$OUTPUT_DIR/arch"
-sync_headers "$KERNEL_MODULES/drivers"       "$OUTPUT_DIR/drivers"
-sync_headers "$KERNEL_MODULES/sound"         "$OUTPUT_DIR/sound"
-sync_headers "$KERNEL_MODULES/fs"            "$OUTPUT_DIR/fs"
-sync_headers "$KERNEL_MODULES/kernel"        "$OUTPUT_DIR/kernel"
-
-# ---------------------------------------------------------
-# Phase 3: Generate the Makefile (The New Part)
-# ---------------------------------------------------------
-echo ">> Phase 3: Generating Makefile..."
-
-# 1. Extract Version from the actual Kernel Source
-# We read the first few lines of the kernel-mtk/Makefile
-K_VERSION=$(grep "^VERSION =" $KERNEL_CORE/Makefile | awk '{print $3}' | head -n 1)
-K_PATCHLEVEL=$(grep "^PATCHLEVEL =" $KERNEL_CORE/Makefile | awk '{print $3}' | head -n 1)
-K_SUBLEVEL=$(grep "^SUBLEVEL =" $KERNEL_CORE/Makefile | awk '{print $3}' | head -n 1)
-
-if [ -z "$K_VERSION" ]; then
-    # Fallback if extraction fails
-    echo "Warning: Could not extract version. Defaulting to 6.1.0"
-    K_VERSION=6
-    K_PATCHLEVEL=1
-    K_SUBLEVEL=0
-else
-    echo "Detected Kernel Version: $K_VERSION.$K_PATCHLEVEL.$K_SUBLEVEL"
+# 2. Mali GPU UAPI (Special Case from Drivers)
+MALI_UAPI_PATH=$(find "$KERNEL_MODULES/drivers" -type d -path "*/midgard/include/uapi" | head -n 1)
+if [ -n "$MALI_UAPI_PATH" ]; then
+    echo "   Found Mali GPU UAPI: $MALI_UAPI_PATH"
+    merge_headers "$MALI_UAPI_PATH" "$OUTPUT_DIR/usr/include"
 fi
 
-# 2. Write the Makefile to the output directory
-cat > "$OUTPUT_DIR/Makefile" <<EOF
-VERSION = $K_VERSION
-PATCHLEVEL = $K_PATCHLEVEL
-SUBLEVEL = $K_SUBLEVEL
+# ---------------------------------------------------------
+# Phase 3: Resolver (Recursive Import Backfill)
+# ---------------------------------------------------------
+echo ">> Phase 3: Resolving Recursive Dependencies..."
+# Logic: Grep for all '#include <...>' usage in the output headers.
+# If a referenced file is missing, copy it from the Kernel Core source.
+# This ensures a self-contained header set without including the entire kernel source.
 
-# Standard clean/install targets for Android Build System
-headers_install:
-	@echo "  INSTALL headers to \$(O)/usr"
-	@mkdir -p \$(O)/usr
-	@rsync -mrq --exclude=Makefile \$(shell pwd)/ \$(O)/
+MAX_LOOPS=30
+LOOP_COUNT=0
 
-modules_install:
-	@true
+while [ $LOOP_COUNT -lt $MAX_LOOPS ]; do
+    LOOP_COUNT=$((LOOP_COUNT+1))
+    echo "   [Loop $LOOP_COUNT] Scanning for missing includes..."
+    
+    # regex matches: #include <path/to/file.h>
+    INCLUDES=$(grep -r -h "^#include <.*>" "$OUTPUT_DIR/usr/include" | \
+               sed 's/#include <//; s/>.*//' | \
+               sort -u)
+    
+    MOVED_COUNT=0
+    
+    for INC in $INCLUDES; do
+        target_path="$OUTPUT_DIR/usr/include/$INC"
+        
+        # If the header reference is missing in our output...
+        if [ ! -f "$target_path" ]; then
+             
+             # Case A: Architecture-specific headers (asm/...), typically located in arch/arm64/include/asm
+             if [[ "$INC" == "asm/"* ]]; then
+                 REAL_NAME="${INC#asm/}"
+                 # Assume arm64 for this device
+                 ARCH_SRC="$KERNEL_CORE/arch/arm64/include/asm/$REAL_NAME"
+                 if [ -f "$ARCH_SRC" ]; then
+                      mkdir -p "$(dirname "$target_path")"
+                      cp "$ARCH_SRC" "$target_path"
+                      MOVED_COUNT=$((MOVED_COUNT+1))
+                 fi
+                 
+             # Case B: Standard headers (linux/..., asm-generic/...), located in include/
+             elif [ -f "$KERNEL_CORE/include/$INC" ]; then
+                 mkdir -p "$(dirname "$target_path")"
+                 cp "$KERNEL_CORE/include/$INC" "$target_path"
+                 MOVED_COUNT=$((MOVED_COUNT+1))
+             fi
+        fi
+    done
+    
+    if [ "$MOVED_COUNT" -eq 0 ]; then
+        echo "   Dependency tree stabilized."
+        break
+    else
+        echo "   -> Added $MOVED_COUNT new headers."
+    fi
+done
 
-all:
-	@true
-EOF
+# Ensure kconfig.h exists (often generated or minimal in userspace)
+if [ ! -f "$OUTPUT_DIR/usr/include/linux/kconfig.h" ]; then
+   touch "$OUTPUT_DIR/usr/include/linux/kconfig.h"
+fi
 
 # ---------------------------------------------------------
-# Phase 4: Final Cleanup
+# Phase 4: Final Cleanup & Compression
 # ---------------------------------------------------------
-echo ">> Phase 4: Final Polish"
-find "$OUTPUT_DIR" -type d -empty -delete
+echo ">> Phase 4: Setting Permissions..."
 find "$OUTPUT_DIR" -type d -exec chmod 755 {} +
 find "$OUTPUT_DIR" -type f -name "*.h" -exec chmod 644 {} +
-chmod 644 "$OUTPUT_DIR/Makefile"
+
+echo ">> Phase 5: Creating Tarball..."
+mkdir -p "$DEST_DIR"
+cd "$OUTPUT_DIR"
+# Archive the 'usr' directory structure
+tar -czf "$DEST_DIR/$TARBALL_NAME" usr/
 
 echo "------------------------------------------------"
-echo "Success! Headers and Makefile ready at: $OUTPUT_DIR"
+echo "Success! Package created at: $DEST_DIR/$TARBALL_NAME"
+
