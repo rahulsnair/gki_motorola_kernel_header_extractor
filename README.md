@@ -2,6 +2,12 @@
 
 This repository documents the minimal and correct steps to prepare an Android **GKI (Generic Kernel Image)** kernel tree for ARM64, using the GNU AArch64 cross-compiler. The result is a clean kernel source ready for external module builds and userspace header extraction.
 
+# 1. Clone the Core Kernel (GKI)
+git clone https://github.com/MotorolaMobilityLLC/kernel-mtk.git -b MMI-W1VV36H.7-21-5 /home/rahulsnair/android/lineage/kernel/motorola/cybert
+
+# 2. Clone the Device Modules (Drivers)
+git clone https://github.com/MotorolaMobilityLLC/kernel-kernel_device_modules-6.1.git -b MMI-W1VV36H.7-21-5 /home/rahulsnair/android/lineage/kernel/motorola/cybert-modules
+
 ---
 
 ## Install Toolchain
@@ -20,7 +26,7 @@ This provides the `aarch64-linux-gnu-` toolchain required for kernel builds.
 ## Navigate to Kernel Source
 
 ```bash
-cd /home/rahulsnair/android/lineage/device/motorola/kernel-mtk
+cd /home/rahulsnair/android/lineage/kernel/motorola/cybert
 ```
 
 Adjust the path according to your local setup.
